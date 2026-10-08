@@ -1,0 +1,1205 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Beaker, Lightbulb, CheckCircle, XCircle, AlertTriangle, ArrowRight, Play, Pause, RotateCcw, Droplets, Flame, Award, BookOpen, Microscope, Users, Clock, Trash2, Key, Volume2, VolumeX } from 'lucide-react';
+import * as Tone from 'tone';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc } from 'firebase/firestore';
+
+// Khởi tạo Firebase (CSDL Lưu trữ Bảng xếp hạng)
+let app, auth, db;
+const appId = typeof window.__app_id !== 'undefined' ? window.__app_id : 'default-app-id';
+try {
+  const config = typeof window.__firebase_config !== 'undefined' ? JSON.parse(window.__firebase_config) : null;
+  if (config) {
+    app = initializeApp(config);
+    auth = getAuth(app);
+    db = getFirestore(app);
+  }
+} catch (e) {
+  console.warn("Chưa cấu hình Firebase - Bảng xếp hạng sẽ lưu trữ nội bộ (Offline).", e);
+}
+
+const initAuth = async () => {
+  if (!auth) return null;
+  if (auth.currentUser) return auth.currentUser;
+  try {
+    const token = typeof window.__initial_auth_token !== 'undefined' ? window.__initial_auth_token : null;
+    if (token) {
+      const cred = await signInWithCustomToken(auth, token);
+      return cred.user;
+    } else {
+      const cred = await signInAnonymously(auth);
+      return cred.user;
+    }
+  } catch (error) {
+    console.error("Lỗi xác thực:", error);
+    return null;
+  }
+};
+
+// --- HỆ THỐNG ÂM THANH (TONE.JS) ---
+let isToneReady = false;
+let isMuted = false;
+let synths = {};
+let bubbleLoop = null;
+
+const setupAudio = async () => {
+  if (isToneReady) return;
+  await Tone.start();
+  
+  // Nhạc nền (Ambient)
+  synths.bgm = new Tone.PolySynth(Tone.Synth, {
+    oscillator: { type: "sine" },
+    envelope: { attack: 1, decay: 0.1, sustain: 1, release: 2 }
+  }).toDestination();
+  synths.bgm.volume.value = -15; // Âm lượng nhạc nền
+  
+  // SFX Thành công
+  synths.success = new Tone.Synth({ oscillator: { type: 'sine' } }).toDestination();
+  synths.success.volume.value = -5;
+  
+  // SFX Lỗi
+  synths.error = new Tone.Synth({ oscillator: { type: 'triangle' } }).toDestination();
+  synths.error.volume.value = -5;
+  
+  // SFX Nút bấm
+  synths.click = new Tone.MembraneSynth().toDestination();
+  synths.click.volume.value = -10;
+
+  // SFX Bọt khí
+  synths.bubble = new Tone.Synth({
+    oscillator: { type: 'sine' },
+    envelope: { attack: 0.01, decay: 0.1, sustain: 0, release: 0.1 }
+  }).toDestination();
+  synths.bubble.volume.value = -15;
+
+  isToneReady = true;
+
+  // Chạy nhạc nền vòng lặp
+  const chords = [ ["C4", "E4", "G4"], ["F3", "A3", "C4"], ["G3", "B3", "D4"], ["E3", "G3", "B3"] ];
+  let step = 0;
+  Tone.Transport.scheduleRepeat(time => {
+    if (!isMuted) synths.bgm.triggerAttackRelease(chords[step % chords.length], "2n", time);
+    step++;
+  }, "1m");
+  Tone.Transport.bpm.value = 60;
+  Tone.Transport.start();
+};
+
+const toggleMuteAudio = () => {
+  isMuted = !isMuted;
+  Tone.Destination.mute = isMuted;
+  return isMuted;
+};
+
+const playSFX = (type) => {
+  if (!isToneReady || isMuted) return;
+  try {
+    if (type === 'success') synths.success.triggerAttackRelease("C6", "16n");
+    if (type === 'error') synths.error.triggerAttackRelease("C3", "8n");
+    if (type === 'click') synths.click.triggerAttackRelease("C4", "32n");
+  } catch (e) {}
+};
+
+const toggleBubblesSFX = (play) => {
+  if (!isToneReady) return;
+  if (play && !bubbleLoop) {
+    bubbleLoop = new Tone.Loop(time => {
+      if (!isMuted) {
+        const freq = Math.random() * 600 + 800; // Tần số bọt khí ngẫu nhiên
+        synths.bubble.triggerAttackRelease(Tone.Frequency(freq).toNote(), "32n", time);
+      }
+    }, "16n").start(0);
+  } else if (!play && bubbleLoop) {
+    bubbleLoop.stop();
+    bubbleLoop.dispose();
+    bubbleLoop = null;
+  }
+};
+
+const customStyles = `
+  @keyframes floatUp {
+    0% { transform: translateY(0) scale(0.5); opacity: 0; }
+    10% { opacity: 0.9; }
+    80% { opacity: 0.8; }
+    100% { transform: translateY(-180px) scale(1.5); opacity: 0; }
+  }
+  .bubble {
+    position: absolute;
+    bottom: 20px;
+    background-color: rgba(255, 255, 255, 0.8);
+    border-radius: 50%;
+    animation: floatUp 2s linear forwards;
+  }
+  @keyframes glow {
+    0% { box-shadow: 0 0 5px #facc15; }
+    50% { box-shadow: 0 0 20px #ef4444; background-color: #ef4444; }
+    100% { box-shadow: 0 0 5px #facc15; }
+  }
+  .glowing-splint {
+    animation: glow 1s ease-in-out infinite alternate;
+  }
+  .glass-panel {
+    background: rgba(255, 255, 255, 0.9);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.5);
+  }
+  .leaf-transition { transition: fill 2s ease-in-out; }
+`;
+
+const STAGES = ['START', 'KHOI_DONG', 'O2_EXP', 'STARCH_EXP', 'ANALYSIS', 'QUIZ', 'REPORT', 'LEADERBOARD'];
+const TOOLS_O2 = [
+  { id: 'plant', name: 'Cây rong đuôi chó', isCorrect: true, icon: '🌿' },
+  { id: 'beaker', name: 'Cốc thủy tinh chứa nước', isCorrect: true, icon: '🥛' },
+  { id: 'funnel', name: 'Phễu thủy tinh', isCorrect: true, icon: '🔽' },
+  { id: 'tube', name: 'Ống nghiệm đầy nước', isCorrect: true, icon: '🧪' },
+  { id: 'light', name: 'Đèn chiếu sáng', isCorrect: true, icon: '💡' },
+  { id: 'microscope', name: 'Kính hiển vi', isCorrect: false, icon: '🔬' },
+  { id: 'thermometer', name: 'Nhiệt kế', isCorrect: false, icon: '🌡️' }
+];
+
+const QUIZ_QUESTIONS = [
+  { q: "Sản phẩm của quá trình quang hợp là gì?", opts: ["CO2 và H2O", "Carbohydrate và O2", "O2 và CO2", "Nước và khoáng"], ans: 1, type: 'mc' },
+  { q: "Iodine được sử dụng để làm gì trong thí nghiệm?", opts: ["Nhận biết khí O2", "Nhận biết tinh bột", "Tạo màu cho lá", "Phá hủy diệp lục"], ans: 1, type: 'mc' },
+  { q: "Khí thu được từ cây thủy sinh có tính chất gì?", opts: ["Làm đục nước vôi trong", "Không duy trì sự cháy", "Hỗ trợ sự cháy", "Có mùi hắc"], ans: 2, type: 'mc' },
+  { q: "Quang hợp diễn ra chủ yếu ở bào quan nào?", opts: ["Không bào", "Ti thể", "Nhân tế bào", "Lục lạp"], ans: 3, type: 'mc' },
+  { q: "Mục đích của việc che một phần lá bằng giấy đen là gì?", opts: ["Tạo đối chứng về điều kiện ánh sáng", "Giúp lá hô hấp tốt hơn", "Ngăn lá mất nước", "Ngăn O2 thoát ra"], ans: 0, type: 'mc' },
+  { q: "Tinh bột là sản phẩm đầu tiên và duy nhất của quang hợp. (Đúng/Sai)", opts: ["Đúng", "Sai"], ans: 1, type: 'tf' },
+  { q: "Cần phải đun sôi lá trong ethanol để loại bỏ diệp lục trước khi thử iodine. (Đúng/Sai)", opts: ["Đúng", "Sai"], ans: 0, type: 'tf' },
+  { q: "Khí O2 sinh ra có nguồn gốc từ việc phân li phân tử nước. (Đúng/Sai)", opts: ["Đúng", "Sai"], ans: 0, type: 'tf' },
+  { q: "Điền khuyết: Quang hợp tạo ra chất hữu cơ, một phần được tích lũy dưới dạng ___ trong lá.", opts: ["Tinh bột", "Protein", "Lipid"], ans: 0, type: 'fill' },
+  { q: "Điền khuyết: Hiện tượng que đóm bùng cháy trở lại chứng tỏ khí thu được là ___.", opts: ["Oxygen", "Carbon dioxide", "Nitrogen"], ans: 0, type: 'fill' },
+  { q: "Vận dụng: Nếu để cây rong trong bóng tối, hiện tượng gì xảy ra?", opts: ["Vẫn nổi bọt khí nhiều", "Nổi bọt khí ít hoặc không nổi", "Nước chuyển màu xanh", "Cây chết ngay"], ans: 1, type: 'app' },
+  { q: "Vận dụng: Dựa vào kết quả lá thử iodine, kết luận nào đúng nhất?", opts: ["Ánh sáng cần cho việc tạo O2", "Ánh sáng cần thiết để tạo tinh bột ở lá", "Iodine là chất dinh dưỡng của cây", "Lá cây có màu đen"], ans: 1, type: 'app' }
+];
+
+const StartScreen = ({ onStart }) => {
+  const [name, setName] = useState('');
+  return (
+    <div className="flex flex-col items-center justify-center h-full p-8 text-center animate-fadeIn bg-slate-50 relative overflow-hidden">
+      <div className="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-10"></div>
+      <Users className="w-24 h-24 text-emerald-500 mb-6 animate-pulse z-10" />
+      <h1 className="text-3xl md:text-5xl font-extrabold text-slate-800 mb-4 drop-shadow-sm z-10">PHÒNG THÍ NGHIỆM SINH HỌC ẢO</h1>
+      <h2 className="text-2xl font-bold text-emerald-600 mb-8 z-10">THỰC HÀNH NHÓM</h2>
+      <p className="text-xl text-slate-600 mb-8 max-w-2xl z-10">
+        Vui lòng nhập tên nhóm của bạn để bắt đầu tính thời gian và ghi nhận thành tích trên Bảng Xếp Hạng.
+      </p>
+      <div className="bg-white p-8 rounded-3xl shadow-2xl w-full max-w-md border border-emerald-100 transform transition-all hover:scale-[1.02] z-10">
+         <input 
+           type="text" 
+           placeholder="Nhập tên nhóm..." 
+           value={name} 
+           onChange={e => setName(e.target.value)} 
+           onKeyDown={e => {
+             if(e.key === 'Enter' && name.trim()){
+               setupAudio();
+               playSFX('click');
+               onStart(name);
+             }
+           }}
+           className="w-full p-4 border-2 border-slate-200 rounded-xl text-xl font-bold text-center focus:border-emerald-500 outline-none mb-6 text-slate-800" 
+         />
+         <button 
+           disabled={!name.trim()} 
+           onClick={() => {
+             setupAudio();
+             playSFX('click');
+             onStart(name);
+           }} 
+           className="w-full py-4 bg-emerald-600 text-white text-xl font-bold rounded-xl shadow-lg hover:bg-emerald-700 disabled:bg-slate-300 disabled:shadow-none transition-all flex items-center justify-center"
+         >
+           <Play className="mr-2" /> Bắt Đầu & Tính Giờ
+         </button>
+      </div>
+    </div>
+  );
+};
+
+const WarmupPhase = ({ showModal, nextStage }) => {
+  const [selected, setSelected] = useState(null);
+  const [isCorrect, setIsCorrect] = useState(false);
+  const handleSelect = (idx) => {
+    playSFX('click');
+    setSelected(idx);
+    if (idx === 1) {
+      setIsCorrect(true);
+      showModal("Chính xác!", "Cây xanh sử dụng CO2 và H2O để tổng hợp chất hữu cơ và giải phóng O2 trong điều kiện có ánh sáng. Chào mừng đến phòng thí nghiệm!", "success");
+    } else {
+      showModal("Gợi ý", "Hãy nhớ rằng cây sử dụng CO2 và H2O để tổng hợp chất hữu cơ (làm thức ăn) trong điều kiện có ánh sáng, đồng thời thải ra một loại khí giúp duy trì sự sống.", "error");
+    }
+  };
+  return (
+    <div className="flex flex-col items-center justify-center h-full p-8 text-center animate-fadeIn">
+      <Microscope className="w-24 h-24 text-emerald-500 mb-6" />
+      <h1 className="text-3xl md:text-4xl font-extrabold text-slate-800 mb-4">PHÒNG THÍ NGHIỆM SINH HỌC ẢO</h1>
+      <p className="text-xl text-slate-600 mb-8 max-w-2xl">Cùng thực hiện thí nghiệm để chứng minh quá trình quang hợp ở thực vật!</p>
+      <div className="bg-emerald-50 p-6 rounded-2xl shadow-inner max-w-2xl w-full border border-emerald-100">
+        <h2 className="text-2xl font-bold text-emerald-800 mb-6">Trong quá trình quang hợp, cây xanh tạo ra những sản phẩm nào?</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {["A. CO₂ và nước", "B. Chất hữu cơ và O₂", "C. O₂ và CO₂", "D. Nước và muối khoáng"].map((opt, idx) => (
+            <button key={idx} onClick={() => handleSelect(idx)}
+              className={`p-4 rounded-xl text-lg font-semibold transition-all border-2 
+                ${selected === idx && idx !== 1 ? 'bg-red-100 border-red-500 text-red-700' : 'bg-white border-slate-200 hover:border-emerald-500 hover:text-emerald-700 hover:shadow-md'}`}>
+              {opt}
+            </button>
+          ))}
+        </div>
+        {isCorrect && (
+          <div className="mt-8 flex justify-center animate-bounce">
+            <button onClick={() => { playSFX('click'); nextStage(); }} className="px-8 py-3 bg-emerald-600 text-white font-bold text-lg rounded-full hover:bg-emerald-700 shadow-xl">
+              Bắt đầu Thí nghiệm ➡️
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const O2Experiment = ({ addScore, awardBadge, showModal, nextStage }) => {
+  const [step, setStep] = useState(1);
+  const [selectedTools, setSelectedTools] = useState([]);
+  const [setupState, setSetupState] = useState([]);
+  const [isLightOn, setIsLightOn] = useState(false);
+  const [timer, setTimer] = useState(0);
+  const [bubbles, setBubbles] = useState([]);
+  const [data, setData] = useState([]);
+  
+  const [step3Done, setStep3Done] = useState(false);
+  const [step4Done, setStep4Done] = useState(false);
+  const [step5Done, setStep5Done] = useState(false);
+
+  const timerRef = useRef(null);
+  const bubbleRef = useRef(null);
+
+  const handleToolSelect = (tool) => {
+    playSFX('click');
+    if (selectedTools.includes(tool.id)) return;
+    if (!tool.isCorrect) {
+      showModal("Chưa chính xác", "Dụng cụ này chưa cần thiết ở bước hiện tại. Hãy suy nghĩ về cách thu khí tạo ra từ cây thủy sinh ngập trong nước.", "error");
+      return;
+    }
+    const newTools = [...selectedTools, tool.id];
+    setSelectedTools(newTools);
+    if (newTools.length === 5) {
+      addScore('tools', 15);
+      showModal("Tuyệt vời!", "Bạn đã chọn đúng các dụng cụ cần thiết. Đóng thông báo và nhấn nút 'Tiếp tục' bên dưới.", "success");
+    }
+  };
+
+  const handleSetup = (toolId) => {
+    playSFX('click');
+    const order = ['beaker', 'plant', 'funnel', 'tube', 'light'];
+    const expectedNext = order[setupState.length];
+    if (toolId !== expectedNext) {
+      showModal("Sai trình tự", "Hãy lắp đặt theo thứ tự hợp lý: Chuẩn bị cốc -> Đặt cây -> Úp phễu thu khí -> Đặt ống nghiệm -> Bố trí đèn.", "error");
+      return;
+    }
+    const newSetup = [...setupState, toolId];
+    setSetupState(newSetup);
+    if (newSetup.length === order.length) {
+      addScore('setup', 15);
+      awardBadge('experimenter', 'Nhà thực nghiệm', '👨‍🔬');
+      showModal("Lắp đặt thành công!", "Bạn đã lắp ráp xong hệ thống thí nghiệm. Đóng thông báo và nhấn nút 'Tiếp tục' bên dưới.", "success");
+    }
+  };
+
+  const handlePredict = (ans) => {
+    playSFX('click');
+    if (ans === 'A') {
+      if (!step3Done) {
+        addScore('predict', 15);
+        setStep3Done(true);
+      }
+      showModal("Đã ghi nhận", "Dự đoán của bạn đã được lưu lại. Đóng thông báo và nhấn 'Tiếp tục' để tiến hành thí nghiệm!", "success");
+    } else {
+      showModal("Thử nghĩ lại", "Nếu quang hợp diễn ra dưới nước và sinh ra khí, bạn sẽ quan sát thấy hiện tượng vật lý gì?", "error");
+    }
+  };
+
+  useEffect(() => {
+    if (isLightOn) {
+      toggleBubblesSFX(true); // Bật âm thanh bọt khí
+      timerRef.current = setInterval(() => {
+        setTimer(t => {
+          const newT = t + 1;
+          if (newT % 60 === 0 && newT <= 300) {
+            const minute = newT / 60;
+            setData(prev => {
+               if (prev.find(p => p.min === minute)) return prev;
+               return [...prev, { min: minute, bubbles: 4 + minute * 4 }];
+            });
+          }
+          if (newT >= 300) {
+            clearInterval(timerRef.current);
+            clearInterval(bubbleRef.current);
+            setIsLightOn(false);
+            toggleBubblesSFX(false);
+            setStep4Done(prev => {
+              if (!prev) {
+                addScore('execute', 20);
+                awardBadge('observer', 'Nhà quan sát', '👁️');
+                showModal("Hoàn thành chiếu sáng", "Bạn đã thu được một lượng khí trong ống nghiệm. Đóng thông báo và nhấn nút 'Tiếp tục'.", "info");
+              }
+              return true;
+            });
+          }
+          return newT;
+        });
+      }, 50);
+
+      bubbleRef.current = setInterval(() => {
+        const numBubbles = Math.floor(Math.random() * 3) + 1;
+        const newBubbles = Array.from({length: numBubbles}).map(() => ({
+           id: Date.now() + Math.random(), 
+           x: Math.random() * 8 + 46,
+           size: Math.random() * 4 + 4,
+           duration: Math.random() * 1.5 + 1.5
+        }));
+        setBubbles(prev => [...prev.slice(-30), ...newBubbles]);
+      }, 250);
+    } else {
+      clearInterval(timerRef.current);
+      clearInterval(bubbleRef.current);
+      toggleBubblesSFX(false);
+    }
+    return () => { 
+      clearInterval(timerRef.current); 
+      clearInterval(bubbleRef.current); 
+      toggleBubblesSFX(false);
+    };
+  }, [isLightOn]);
+
+  const visualizerNode = (
+    <div className="relative w-64 h-80 bg-white rounded-xl shadow-inner border-2 border-slate-200 flex flex-col items-center justify-end p-4 overflow-hidden mt-4">
+      {setupState.includes('beaker') && <div className="absolute bottom-0 w-full h-3/4 bg-blue-100/50 border-t-2 border-blue-200 transition-all duration-1000"></div>}
+      {setupState.includes('light') && (
+        <div className={`absolute top-2 right-2 text-4xl transition-opacity duration-300 ${isLightOn ? 'opacity-100 drop-shadow-[0_0_15px_rgba(250,204,21,0.8)]' : 'opacity-50'}`}>💡</div>
+      )}
+      {isLightOn && <div className="absolute top-10 right-10 w-full h-full bg-yellow-200/20 rotate-45 transform origin-top-right"></div>}
+      {setupState.includes('plant') && <div className="absolute bottom-10 text-5xl z-10 animate-pulse">🌿</div>}
+      {setupState.includes('funnel') && (
+        <svg width="60" height="60" viewBox="0 0 100 100" className="absolute bottom-20 z-20 opacity-80">
+          <polygon points="10,90 90,90 60,30 60,10 40,10 40,30" fill="none" stroke="#94a3b8" strokeWidth="4"/>
+        </svg>
+      )}
+      {setupState.includes('tube') && (
+        <div className="absolute bottom-[110px] w-6 h-24 border-2 border-b-0 border-slate-300 rounded-t-full bg-blue-50/50 z-30 flex flex-col items-center justify-end">
+           <div className="w-full bg-white/80 transition-all duration-1000 rounded-t-full" style={{height: `${Math.min((timer/300)*100, 100)}%`}}></div>
+        </div>
+      )}
+      {bubbles.map(b => (
+        <div key={b.id} className="absolute rounded-full bg-white/90 border border-slate-300 shadow-sm z-20" style={{
+            left: `${b.x}%`, 
+            bottom: '70px', 
+            width: `${b.size}px`, 
+            height: `${b.size}px`,
+            animation: `floatUp ${b.duration}s ease-in forwards`
+        }}></div>
+      ))}
+      {step === 5 && (
+        <div className="absolute top-[80px] z-40 flex flex-col items-center animate-bounce">
+          <div className="w-1 h-12 bg-amber-800"></div>
+          <div className="w-3 h-3 rounded-full glowing-splint"></div>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="flex flex-col lg:flex-row gap-6 p-6 h-full">
+      <div className="flex-1 glass-panel rounded-2xl p-6 shadow-lg flex flex-col">
+        <h2 className="text-2xl font-bold text-slate-800 mb-2">Thí nghiệm 1: Thu khí O₂</h2>
+        {step === 1 && (
+           <div>
+             <p className="text-slate-600 mb-4 font-semibold">BƯỚC 1: Hãy chọn 5 dụng cụ cần thiết từ kho.</p>
+             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+               {TOOLS_O2.map(t => (
+                 <button key={t.id} onClick={() => handleToolSelect(t)}
+                   className={`p-4 rounded-xl border-2 flex flex-col items-center justify-center transition-all ${selectedTools.includes(t.id) ? 'bg-emerald-100 border-emerald-500 opacity-50' : 'bg-white border-slate-200 hover:border-emerald-400 hover:shadow-md'}`}>
+                   <span className="text-3xl mb-2">{t.icon}</span>
+                 <span className="text-sm font-medium text-center">{t.name}</span>
+               </button>
+             ))}
+           </div>
+           {selectedTools.length === 5 && (
+             <div className="mt-6 flex justify-center animate-bounce">
+               <button onClick={() => { playSFX('click'); setStep(2); }} className="px-8 py-3 bg-emerald-600 text-white font-bold rounded-xl shadow-lg hover:bg-emerald-700">
+                 Tiếp tục: BƯỚC 2 (Lắp đặt) ➡️
+               </button>
+             </div>
+           )}
+         </div>
+      )}
+      {step === 2 && (
+         <div>
+           <p className="text-slate-600 mb-4 font-semibold">BƯỚC 2: Bấm vào dụng cụ bên dưới để lắp đặt theo đúng trình tự.</p>
+           <div className="flex flex-wrap gap-3">
+             {TOOLS_O2.filter(t => t.isCorrect).map(t => (
+               <button key={t.id} onClick={() => handleSetup(t.id)} disabled={setupState.includes(t.id)}
+                 className={`px-4 py-2 rounded-lg font-medium transition-all ${setupState.includes(t.id) ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-emerald-100 text-emerald-800 hover:bg-emerald-200'}`}>
+                 {t.icon} {t.name}
+               </button>
+             ))}
+           </div>
+           {setupState.length === 5 && (
+             <div className="mt-6 flex justify-center animate-bounce">
+               <button onClick={() => { playSFX('click'); setStep(3); }} className="px-8 py-3 bg-emerald-600 text-white font-bold rounded-xl shadow-lg hover:bg-emerald-700">
+                 Tiếp tục: BƯỚC 3 (Dự đoán) ➡️
+               </button>
+             </div>
+           )}
+         </div>
+      )}
+      {step === 3 && (
+        <div className="bg-amber-50 p-6 rounded-xl border border-amber-200 mt-4">
+           <h3 className="text-lg font-bold text-amber-800 mb-4">DỰ ĐOÁN: Trước khi bật đèn, điều gì sẽ xảy ra sau một thời gian chiếu sáng?</h3>
+           <div className="flex flex-col gap-3">
+             {["A. Xuất hiện nhiều bọt khí từ lá cây.", "B. Không có hiện tượng gì.", "C. Cây hấp thụ toàn bộ nước.", "D. Ống nghiệm chứa đầy CO₂."].map((opt, i) => (
+               <button key={i} onClick={() => handlePredict(opt[0])} className="text-left p-3 rounded-lg bg-white border border-amber-100 hover:bg-amber-100 font-medium transition-colors">
+                 {opt}
+               </button>
+             ))}
+           </div>
+           {step3Done && (
+             <div className="mt-6 flex justify-center animate-bounce">
+               <button onClick={() => { playSFX('click'); setStep(4); }} className="px-8 py-3 bg-amber-600 text-white font-bold rounded-xl shadow-lg hover:bg-amber-700">
+                 Tiếp tục: BƯỚC 4 (Tiến hành) ➡️
+               </button>
+             </div>
+           )}
+        </div>
+      )}
+      {step === 4 && (
+        <div>
+           <p className="text-slate-600 mb-4 font-semibold">BƯỚC 4: Tiến hành chiếu sáng.</p>
+           <div className="flex items-center gap-4 mb-6">
+               <button onClick={() => { playSFX('click'); setIsLightOn(!isLightOn); }} 
+                 className={`flex items-center px-6 py-3 rounded-xl font-bold text-white transition-all shadow-md ${isLightOn ? 'bg-amber-500 hover:bg-amber-600' : 'bg-emerald-500 hover:bg-emerald-600'}`}>
+                 {isLightOn ? <Pause className="mr-2" /> : <Play className="mr-2" />} 
+                 {isLightOn ? "TẠM DỪNG" : "BẬT ĐÈN"}
+               </button>
+               <div className="text-2xl font-mono bg-slate-800 text-emerald-400 px-4 py-2 rounded-lg">
+                  {String(Math.floor(timer/60)).padStart(2,'0')}:{String(timer%60).padStart(2,'0')}
+               </div>
+             </div>
+
+             {/* HÌNH ẢNH ĐỘNG MÔ PHỎNG CẬN CẢNH */}
+             {isLightOn && (
+               <div className="relative w-full h-56 bg-gradient-to-b from-blue-200 to-blue-400 rounded-xl overflow-hidden mb-6 border-4 border-slate-300 shadow-inner flex items-center justify-center animate-fadeIn">
+                 <div className="absolute top-3 left-3 bg-white/90 px-4 py-1.5 rounded-full text-xs font-bold text-blue-800 shadow-md z-30 flex items-center">
+                   🔍 Góc nhìn cận cảnh: Khí Oxygen sinh ra từ lá rong
+                 </div>
+                 
+                 <div className="relative z-10 w-2 h-40 bg-green-700 rounded-full mt-12 shadow-sm">
+                    <div className="absolute top-2 w-16 h-5 bg-green-500 rounded-full rotate-[35deg] -ml-12 opacity-90 shadow-sm border-b border-green-700"></div>
+                    <div className="absolute top-8 w-16 h-5 bg-green-500 rounded-full -rotate-[35deg] ml-2 opacity-90 shadow-sm border-b border-green-700"></div>
+                    <div className="absolute top-16 w-14 h-4 bg-green-600 rounded-full rotate-[40deg] -ml-10 opacity-90 shadow-sm border-b border-green-800"></div>
+                    <div className="absolute top-22 w-14 h-4 bg-green-600 rounded-full -rotate-[40deg] ml-2 opacity-90 shadow-sm border-b border-green-800"></div>
+                    <div className="absolute top-30 w-12 h-4 bg-green-700 rounded-full rotate-[45deg] -ml-8 opacity-90 shadow-sm"></div>
+                 </div>
+                 
+                 <div className="absolute inset-0 z-20">
+                    {Array.from({length: 30}).map((_, i) => {
+                       const size = 5 + Math.random() * 8;
+                       return (
+                         <div key={i} className="absolute bg-white rounded-full border border-blue-100 shadow-sm"
+                              style={{
+                                  left: `${35 + Math.random() * 30}%`,
+                                  bottom: `${Math.random() * 30}%`,
+                                  width: `${size}px`,
+                                  height: `${size}px`,
+                                  animation: `floatUp ${1.2 + Math.random() * 2}s infinite ease-in`,
+                                  animationDelay: `${Math.random() * 2}s`,
+                                  opacity: 0
+                              }}>
+                         </div>
+                       )
+                    })}
+                 </div>
+                 
+                 <div className="absolute top-0 right-0 w-full h-full bg-gradient-to-bl from-yellow-300/40 to-transparent mix-blend-overlay z-30 animate-pulse pointer-events-none"></div>
+               </div>
+             )}
+
+             <div className="w-full bg-white rounded-lg border border-slate-200 overflow-hidden">
+               <table className="w-full text-sm text-left">
+                 <thead className="text-xs text-slate-700 uppercase bg-slate-50">
+                   <tr><th className="px-6 py-3">Thời gian (Phút)</th><th className="px-6 py-3">Số bọt khí (ước lượng)</th></tr>
+                 </thead>
+                 <tbody>
+                   {data.map((row, i) => (
+                     <tr key={i} className="border-b bg-white"><td className="px-6 py-2 font-medium">{row.min}</td><td className="px-6 py-2 text-emerald-600 font-bold">{row.bubbles}</td></tr>
+                   ))}
+                 </tbody>
+               </table>
+             </div>
+             {step4Done && (
+               <div className="mt-6 flex justify-center animate-bounce">
+                 <button onClick={() => { playSFX('click'); setStep(5); }} className="px-8 py-3 bg-emerald-600 text-white font-bold rounded-xl shadow-lg hover:bg-emerald-700">
+                   Tiếp tục: BƯỚC 5 (Kiểm tra khí) ➡️
+                 </button>
+               </div>
+             )}
+          </div>
+        )}
+        {step === 5 && (
+          <div className="bg-blue-50 p-6 rounded-xl border border-blue-200 mt-4 animate-fadeIn">
+             <h3 className="text-lg font-bold text-blue-800 mb-4">BƯỚC 5: Kiểm tra khí thu được.</h3>
+             <p className="mb-4 text-slate-700">Mô phỏng: Đưa que đóm còn tàn đỏ vào phần khí trong ống nghiệm.</p>
+             <div className="p-4 bg-white rounded-lg border border-red-200 mb-4 flex items-center shadow-sm">
+               <Flame className="text-red-500 w-8 h-8 mr-3 animate-pulse" />
+               <span className="font-bold text-red-600">Hiện tượng: Que đóm bùng cháy trở lại sáng rực!</span>
+             </div>
+             <p className="font-semibold mb-2">Hiện tượng trên chứng tỏ khí thu được có đặc điểm gì?</p>
+             <div className="grid grid-cols-2 gap-3">
+               {["A. Không hỗ trợ sự cháy.", "B. Hỗ trợ sự cháy (Oxygen).", "C. Là CO₂.", "D. Là Nitrogen."].map((opt, i) => (
+                 <button key={i} onClick={() => {
+                   playSFX('click');
+                   if(i === 1) {
+                     if (!step5Done) setStep5Done(true);
+                     showModal("Kết luận chính xác!", "Khí Oxygen (O2) có tính chất hỗ trợ sự cháy. Kết quả này là bằng chứng cho thấy cây thủy sinh trong điều kiện có ánh sáng đã quang hợp và giải phóng O2.\n\n⚠️ Lưu ý: Trong thực tế, cần thực hiện kiểm tra khí theo quy trình an toàn.", "success");
+                   } else {
+                     showModal("Suy nghĩ lại", "Khí nào trong không khí giúp duy trì ngọn lửa?", "error");
+                   }
+                 }} className="p-2 border rounded hover:bg-blue-100 transition-colors">{opt}</button>
+               ))}
+             </div>
+             {step5Done && (
+               <div className="mt-6 flex justify-center animate-bounce">
+                 <button onClick={() => { playSFX('click'); nextStage(); }} className="px-8 py-3 bg-blue-600 text-white font-bold rounded-xl shadow-lg hover:bg-blue-700">
+                   Chuyển sang THÍ NGHIỆM 2 ➡️
+                 </button>
+               </div>
+             )}
+          </div>
+        )}
+      </div>
+      <div className="w-full lg:w-1/3 flex items-center justify-center bg-slate-50 rounded-2xl border-2 border-dashed border-slate-300">
+         {visualizerNode}
+      </div>
+    </div>
+  );
+};
+
+const StarchExperiment = ({ addScore, showModal, nextStage }) => {
+  const [step, setStep] = useState(1);
+  const [leafState, setLeafState] = useState('normal'); 
+  const [step1Done, setStep1Done] = useState(false);
+  const [step3Done, setStep3Done] = useState(false);
+  const [step5Done, setStep5Done] = useState(false);
+  
+  const handleStep1 = (ans) => {
+    playSFX('click');
+    if(ans === 0) {
+      setStep1Done(true);
+      showModal("Đúng!", "Hai phần của cùng một lá có điều kiện giống nhau về cơ bản (nước, CO2, nhiệt độ), khác nhau chủ yếu ở khả năng nhận ánh sáng. Đây là cách thiết lập thí nghiệm đối chứng hoàn hảo.", "success");
+    } else {
+      showModal("Chưa đúng", "Che một phần trên cùng một lá giúp so sánh trực tiếp phần có ánh sáng và không có ánh sáng trong cùng một điều kiện sinh lý.", "error");
+    }
+  };
+
+  const handleBoil = () => {
+    playSFX('click');
+    setStep3Done(true);
+    showModal("CẢNH BÁO AN TOÀN", "⚠️ Ethanol dễ cháy. Trong thực tế, phải đun cách thủy ethanol bằng bếp điện, tuyệt đối không dùng ngọn lửa trực tiếp. Thí nghiệm cần sự giám sát của giáo viên.", "info");
+  };
+
+  const leafVisualNode = (
+    <div className="relative w-64 h-64 flex justify-center items-center">
+      <svg viewBox="0 0 100 100" className="w-full h-full drop-shadow-lg">
+        <path d="M50,90 Q50,70 50,50" stroke="#4d7c0f" strokeWidth="3" fill="none"/>
+        <path d="M50,10 Q20,30 50,90" fill={
+          leafState === 'normal' || leafState === 'covered' ? '#4ade80' : 
+          leafState === 'ethanol' ? '#fef08a' : 
+          leafState === 'iodine' ? '#1e1b4b' : '#4ade80'
+        } className="leaf-transition"/>
+        <path d="M50,10 Q80,30 50,90" fill={
+          leafState === 'normal' ? '#4ade80' : 
+          leafState === 'covered' ? '#1f2937' :
+          leafState === 'ethanol' ? '#fef08a' : 
+          leafState === 'iodine' ? '#fef08a' : '#4ade80'
+        } className="leaf-transition"/>
+        <path d="M50,10 L50,90 M50,30 Q35,40 30,30 M50,50 Q35,60 30,50 M50,70 Q35,80 30,70 M50,30 Q65,40 70,30 M50,50 Q65,60 70,50 M50,70 Q65,80 70,70" stroke="rgba(0,0,0,0.1)" strokeWidth="1" fill="none"/>
+      </svg>
+      {leafState === 'covered' && <div className="absolute right-[20%] top-[30%] text-xs font-bold text-white bg-black/50 px-1 rounded">Giấy đen</div>}
+    </div>
+  );
+
+  return (
+    <div className="flex flex-col lg:flex-row gap-6 p-6 h-full">
+      <div className="flex-1 glass-panel rounded-2xl p-6 shadow-lg">
+        <h2 className="text-2xl font-bold text-slate-800 mb-4">Thí nghiệm 2: Sự tạo thành tinh bột</h2>
+        {step === 1 && (
+          <div className="animate-fadeIn">
+            <p className="mb-4">BƯỚC 1: Chuẩn bị chậu cây xanh, che kín một phần lá bằng giấy đen.</p>
+            <div className="bg-emerald-50 p-4 rounded-lg border border-emerald-200">
+              <p className="font-bold text-emerald-800 mb-3">Vì sao chỉ che một phần lá?</p>
+              <div className="flex flex-col gap-2">
+                {["A. Để tạo đối chứng ngay trên cùng một lá.", "B. Để lá không bị mất nước.", "C. Để lá đổi màu đẹp hơn."].map((txt, i) => (
+                  <button key={i} onClick={() => handleStep1(i)} className="text-left p-2 border rounded bg-white hover:bg-emerald-100">{txt}</button>
+                ))}
+              </div>
+            </div>
+            {step1Done && (
+              <div className="mt-6 flex justify-center animate-bounce">
+                <button onClick={() => { playSFX('click'); setLeafState('covered'); setStep(2); }} className="px-8 py-3 bg-emerald-600 text-white font-bold rounded-xl shadow-lg hover:bg-emerald-700">
+                  Tiếp tục: BƯỚC 2 (Chiếu sáng) ➡️
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+        {step === 2 && (
+          <div className="animate-fadeIn text-center py-10">
+            <Lightbulb className="w-16 h-16 text-yellow-400 mx-auto mb-4 animate-pulse" />
+            <p className="text-xl font-bold text-slate-700 mb-6">Chiếu sáng cây trong 4-6 giờ...</p>
+            <button onClick={() => { playSFX('click'); setStep(3); }} className="px-6 py-2 bg-emerald-500 text-white rounded-lg font-bold shadow-md hover:bg-emerald-600">Đã xong, ngắt lá</button>
+          </div>
+        )}
+        {step === 3 && (
+          <div className="animate-fadeIn">
+            <p className="mb-4 font-bold text-red-600">BƯỚC 3: Loại bỏ diệp lục</p>
+            <p className="text-sm text-slate-600 mb-4">Để quan sát rõ màu của iodine với tinh bột, ta cần rút kiệt sắc tố xanh (diệp lục) của lá bằng dung dịch cồn (ethanol) đun sôi cách thủy.</p>
+            <button onClick={handleBoil} className="w-full py-4 bg-orange-100 hover:bg-orange-200 border-2 border-orange-400 text-orange-800 font-bold rounded-xl flex items-center justify-center">
+              <Droplets className="mr-2" /> Tiến hành đun cách thủy lá trong Ethanol
+            </button>
+            {step3Done && (
+              <div className="mt-6 flex justify-center animate-bounce">
+                <button onClick={() => { playSFX('click'); setLeafState('ethanol'); setStep(4); }} className="px-8 py-3 bg-emerald-600 text-white font-bold rounded-xl shadow-lg hover:bg-emerald-700">
+                  Tiếp tục: BƯỚC 4 (Nhỏ Iodine) ➡️
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+        {step === 4 && (
+          <div className="animate-fadeIn">
+            <p className="mb-4 font-bold">BƯỚC 4: Kiểm tra tinh bột</p>
+            <p className="mb-4">Lá đã chuyển sang màu trắng nhạt. Hãy nhỏ dung dịch Iodine lên toàn bộ bề mặt lá.</p>
+            <button onClick={() => {
+              playSFX('click');
+              setLeafState('iodine');
+              setTimeout(() => { playSFX('success'); setStep(5); }, 2000);
+            }} className="px-6 py-3 bg-purple-600 text-white font-bold rounded-xl hover:bg-purple-700 w-full mb-4 shadow-lg">
+              Nhỏ dung dịch Iodine
+            </button>
+          </div>
+        )}
+        {step === 5 && (
+          <div className="animate-fadeIn bg-slate-50 p-4 rounded-lg border">
+            <h3 className="font-bold text-lg mb-2">Phân tích kết quả</h3>
+            <p className="mb-4">Quan sát sự đổi màu trên lá. Phần nào chuyển sang màu xanh tím đậm?</p>
+            <div className="grid grid-cols-2 gap-2 mb-6">
+              <button onClick={() => {
+                 playSFX('click');
+                 if (!step5Done) {
+                     addScore('record', 15);
+                     setStep5Done(true);
+                 }
+                 showModal("Chính xác", "Phần không bị che (được chiếu sáng) đổi màu xanh tím đặc trưng khi gặp iodine, chứng tỏ CÓ tinh bột. Phần bị che sáng không đổi màu.", "success");
+              }} className="p-3 bg-white border rounded shadow-sm hover:bg-emerald-50 text-center font-medium">Phần được chiếu sáng</button>
+              <button onClick={() => { playSFX('click'); showModal("Sai", "Quan sát kĩ phần nửa lá bên trái (không che) và nửa phải (đã bị che đen lúc đầu).", "error"); }} className="p-3 bg-white border rounded shadow-sm hover:bg-red-50 text-center font-medium">Phần bị che đen</button>
+            </div>
+            {step5Done && (
+              <div className="mt-6 flex justify-center animate-bounce">
+                <button onClick={() => { playSFX('click'); nextStage(); }} className="px-8 py-3 bg-emerald-600 text-white font-bold rounded-xl shadow-lg hover:bg-emerald-700">
+                  Chuyển sang PHÂN TÍCH ➡️
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="w-full lg:w-1/3 flex items-center justify-center bg-slate-100 rounded-2xl">
+        {leafVisualNode}
+      </div>
+    </div>
+  );
+};
+
+const CellAnalysis = ({ addScore, awardBadge, showModal, nextStage }) => {
+  const [selectedItems, setSelectedItems] = useState([]);
+  const correctOrder = ['light', 'co2', 'h2o', 'chloroplast', 'organic', 'o2'];
+  const names = { light: 'Ánh sáng', co2: 'CO₂', h2o: 'H₂O', chloroplast: 'Lục lạp', organic: 'Chất hữu cơ', o2: 'O₂' };
+
+  const handleSelect = (item) => {
+    playSFX('click');
+    if (selectedItems.includes(item)) return;
+    const expected = correctOrder[selectedItems.length];
+    if (item !== expected) {
+      showModal("Chưa đúng quy trình", `Bạn đã chọn ${names[item]}. Hãy suy nghĩ xem yếu tố nào cần thiết trước (Nguyên liệu/Điều kiện -> Bào quan -> Sản phẩm). Gợi ý: Ánh sáng -> CO2 -> Nước -> Lục lạp...`, "error");
+      return;
+    }
+    const newItems = [...selectedItems, item];
+    setSelectedItems(newItems);
+    if (newItems.length === correctOrder.length) {
+      addScore('explain', 10);
+      awardBadge('analyst', 'Nhà phân tích', '🔍');
+      showModal("Hoàn hảo!", "Quang hợp là quá trình lục lạp hấp thụ năng lượng ánh sáng để tổng hợp chất hữu cơ từ CO2 và H2O, đồng thời giải phóng O2. Hãy đóng thông báo và nhấn nút Tiếp tục.", "success");
+    }
+  };
+
+  return (
+    <div className="p-6 h-full flex flex-col animate-fadeIn">
+      <h2 className="text-3xl font-extrabold text-slate-800 text-center mb-2">ĐIỀU GÌ ĐANG XẢY RA TRONG LÁ?</h2>
+      <p className="text-center text-slate-600 mb-8 max-w-2xl mx-auto">Hãy nhấp vào các thành phần theo đúng trình tự diễn ra quá trình quang hợp: <br/><span className="font-semibold text-emerald-600">(Điều kiện + Nguyên liệu) ➡️ (Nơi diễn ra) ➡️ (Sản phẩm)</span></p>
+      <div className="flex-1 flex flex-col md:flex-row items-center justify-center gap-10">
+        <div className="flex flex-col gap-4">
+           <button onClick={()=>handleSelect('light')} className={`p-4 rounded-full text-xl font-bold border-4 ${selectedItems.includes('light') ? 'bg-yellow-400 border-yellow-500 text-white' : 'bg-white border-slate-200'} transition-transform hover:scale-105`}>☀️ Ánh sáng</button>
+           <button onClick={()=>handleSelect('co2')} className={`p-4 rounded-full text-xl font-bold border-4 ${selectedItems.includes('co2') ? 'bg-slate-400 border-slate-500 text-white' : 'bg-white border-slate-200'} transition-transform hover:scale-105`}>☁️ CO₂</button>
+           <button onClick={()=>handleSelect('h2o')} className={`p-4 rounded-full text-xl font-bold border-4 ${selectedItems.includes('h2o') ? 'bg-blue-400 border-blue-500 text-white' : 'bg-white border-slate-200'} transition-transform hover:scale-105`}>💧 H₂O</button>
+        </div>
+        <button onClick={()=>handleSelect('chloroplast')} className={`w-40 h-64 rounded-[100px] border-8 flex items-center justify-center flex-col transition-all duration-500 ${selectedItems.includes('chloroplast') ? 'bg-emerald-500 border-emerald-600 scale-110 shadow-[0_0_30px_rgba(16,185,129,0.5)]' : 'bg-emerald-100 border-emerald-300'}`}>
+           <span className="text-5xl mb-2">🦠</span>
+           <span className="font-bold text-emerald-900 text-lg">Lục lạp</span>
+           {selectedItems.length === 6 && <span className="mt-4 animate-spin text-white">⚙️</span>}
+        </button>
+        <div className="flex flex-col gap-4">
+           <button onClick={()=>handleSelect('organic')} className={`p-4 rounded-full text-xl font-bold border-4 ${selectedItems.includes('organic') ? 'bg-amber-700 border-amber-800 text-white' : 'bg-white border-slate-200'} transition-transform hover:scale-105`}>🍞 Chất hữu cơ</button>
+           <button onClick={()=>handleSelect('o2')} className={`p-4 rounded-full text-xl font-bold border-4 ${selectedItems.includes('o2') ? 'bg-cyan-400 border-cyan-500 text-white' : 'bg-white border-slate-200'} transition-transform hover:scale-105`}>💨 O₂</button>
+        </div>
+      </div>
+      {selectedItems.length === 6 && (
+        <div className="mt-8 text-center animate-bounce">
+          <button onClick={() => { playSFX('click'); nextStage(); }} className="px-8 py-3 bg-emerald-600 text-white font-bold text-lg rounded-full hover:bg-emerald-700 shadow-xl">Thực hiện bài kiểm tra ➡️</button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const Quiz = ({ awardBadge, nextStage, addScore }) => {
+  const [qIndex, setQIndex] = useState(0);
+  const [answers, setAnswers] = useState({});
+  const [showResults, setShowResults] = useState(false);
+  const q = QUIZ_QUESTIONS[qIndex];
+
+  const handleAnswer = (ansIdx) => {
+    playSFX('click');
+    const newAnswers = {...answers, [qIndex]: ansIdx};
+    setAnswers(newAnswers);
+    if (qIndex < QUIZ_QUESTIONS.length - 1) {
+      setTimeout(() => setQIndex(qIndex + 1), 300);
+    } else {
+      let correct = 0;
+      Object.keys(newAnswers).forEach(k => {
+        if (newAnswers[k] === QUIZ_QUESTIONS[k].ans) correct++;
+      });
+      addScore('quiz', correct * 10);
+      setTimeout(() => { playSFX('success'); setShowResults(true); }, 500);
+    }
+  };
+
+  const calculateScore = () => {
+    let correct = 0;
+    Object.keys(answers).forEach(k => {
+      if (answers[k] === QUIZ_QUESTIONS[k].ans) correct++;
+    });
+    return correct;
+  };
+
+  if (showResults) {
+    const correctCount = calculateScore();
+    return (
+      <div className="flex flex-col items-center justify-center h-full p-6 animate-fadeIn">
+        <h2 className="text-3xl font-bold text-slate-800 mb-6">Kết Quả Kiểm Tra</h2>
+        <div className="text-6xl font-extrabold text-emerald-500 mb-4">{correctCount} / 12</div>
+        <p className="text-xl text-slate-600 mb-2">Bạn đã trả lời đúng {correctCount} câu hỏi.</p>
+        <p className="text-2xl font-bold text-emerald-600 mb-8">Điểm bài kiểm tra: {correctCount * 10} Điểm</p>
+        <button onClick={() => {
+          playSFX('click');
+          if (correctCount >= 10) awardBadge('biologist', 'Nhà Sinh Học Nhí', '🏆');
+          nextStage();
+        }} className="px-8 py-4 bg-emerald-600 text-white rounded-xl font-bold shadow-lg hover:bg-emerald-700 text-lg">
+          Viết Báo Cáo Tổng Kết
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-3xl mx-auto mt-10 p-8 bg-white rounded-2xl shadow-xl border border-slate-100">
+      <div className="flex justify-between items-center mb-6">
+        <span className="text-sm font-bold text-emerald-600 bg-emerald-100 px-3 py-1 rounded-full">Câu hỏi {qIndex + 1}/12</span>
+        <span className="text-sm font-medium text-slate-500">{q.type === 'mc' ? 'Trắc nghiệm' : q.type === 'tf' ? 'Đúng/Sai' : 'Vận dụng/Điền khuyết'}</span>
+      </div>
+      <h3 className="text-2xl font-bold text-slate-800 mb-8 leading-relaxed">{q.q}</h3>
+      <div className="grid grid-cols-1 gap-4">
+        {q.opts.map((opt, idx) => (
+           <button key={idx} onClick={() => handleAnswer(idx)}
+             className="p-4 border-2 border-slate-200 rounded-xl text-left text-lg font-medium hover:border-emerald-500 hover:bg-emerald-50 transition-all text-slate-700">
+             {opt}
+           </button>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const Report = ({ score, badges, addScore, onComplete, showModal }) => {
+  const [submitted, setSubmitted] = useState(false);
+  const [textO2, setTextO2] = useState('');
+  const [textStarch, setTextStarch] = useState('');
+  const [textConclusion, setTextConclusion] = useState('');
+  
+  const handleSubmit = () => {
+    playSFX('click');
+    let pts = 0;
+    let feedback = [];
+    const t1 = textO2.toLowerCase();
+    const t2 = textStarch.toLowerCase();
+    const t3 = textConclusion.toLowerCase();
+
+    // Chấm điểm
+    if ((t1.includes('bọt') || t1.includes('khí')) && (t1.includes('cháy') || t1.includes('sáng') || t1.includes('đóm'))) {
+        pts += 10; addScore('report_o2', 10); feedback.push("✔️ Hiện tượng Thí nghiệm 1: Trả lời chính xác (+10đ)");
+    } else { feedback.push("❌ Hiện tượng Thí nghiệm 1: Chưa đầy đủ (Cần nêu bọt khí và que đóm bùng cháy)."); }
+
+    if (t2.includes('xanh') || t2.includes('tím') || t2.includes('đen') || t2.includes('đậm')) {
+        pts += 10; addScore('report_starch', 10); feedback.push("✔️ Hiện tượng Thí nghiệm 2: Trả lời chính xác (+10đ)");
+    } else { feedback.push("❌ Hiện tượng Thí nghiệm 2: Chưa đầy đủ (Cần nêu phần lá đổi màu xanh tím)."); }
+
+    if ((t3.includes('o2') || t3.includes('oxy') || t3.includes('oxi') || t3.includes('khí')) && (t3.includes('tinh bột') || t3.includes('hữu cơ'))) {
+        pts += 10; addScore('report_conclude', 10); feedback.push("✔️ Kết luận chung: Trả lời chính xác (+10đ)");
+    } else { feedback.push("❌ Kết luận chung: Chưa đầy đủ (Cần nêu rõ tạo ra O2 và tinh bột)."); }
+
+    showModal("Kết quả chấm Báo cáo", feedback.join('\n\n'), "info", () => setSubmitted(true));
+  };
+
+  if (submitted) {
+    return (
+      <div className="p-8 max-w-4xl mx-auto animate-fadeIn bg-white rounded-2xl shadow-xl mt-6">
+         <h2 className="text-3xl font-bold text-center text-emerald-800 mb-6">KẾT LUẬN CHUNG</h2>
+         <div className="bg-emerald-50 p-6 rounded-xl border border-emerald-200 mb-8 text-lg text-slate-700 leading-relaxed text-justify">
+           "Qua thí nghiệm với cây thủy sinh, có thể quan sát sự giải phóng khí <b>O₂</b> (hỗ trợ sự cháy) trong điều kiện thích hợp cho quang hợp. Qua thí nghiệm với lá cây và <b>iodine</b>, phần lá được chiếu sáng có sự tích lũy <b>tinh bột</b> (bắt màu xanh tím). Những kết quả này cung cấp bằng chứng thực nghiệm cho thấy quang hợp tạo ra <b>chất hữu cơ</b> và giải phóng <b>O₂</b>."
+           <br/><br/>
+           <i className="text-sm text-emerald-600">*Lưu ý: Quang hợp tạo ra carbohydrate/chất hữu cơ; một phần carbohydrate được chuyển thành và tích lũy dưới dạng tinh bột trong lá.</i>
+         </div>
+         <div className="flex justify-center mb-8">
+           <div className="bg-slate-800 text-white p-6 rounded-xl shadow-2xl inline-block text-center border-4 border-slate-700">
+              <div className="text-yellow-400 font-bold mb-2">☀️ ÁNH SÁNG</div>
+              <div className="text-2xl mb-2">⬇️</div>
+              <div className="flex justify-center gap-4 text-xl font-semibold mb-2">
+                <span className="text-slate-300">CO₂</span> + <span className="text-blue-300">H₂O</span>
+              </div>
+              <div className="text-2xl mb-2">⬇️</div>
+              <div className="bg-emerald-500 text-white px-6 py-2 rounded-lg font-bold text-xl inline-block mb-2">QUANG HỢP</div>
+              <div className="text-2xl mb-2">⬇️</div>
+              <div className="flex justify-center gap-4 text-xl font-semibold mb-2">
+                <span className="text-amber-300">CHẤT HỮU CƠ</span> + <span className="text-cyan-300">O₂</span>
+              </div>
+              <div className="text-xl mb-1">⬇️</div>
+              <div className="text-purple-300 font-bold">TINH BỘT ĐƯỢC TÍCH LŨY</div>
+           </div>
+         </div>
+         <div className="text-center">
+           <div className="inline-flex gap-4 mb-6">
+             {badges.map(b => (
+               <div key={b.id} className="flex flex-col items-center p-3 bg-slate-100 rounded-xl border border-slate-200">
+                 <span className="text-4xl mb-1">{b.icon}</span>
+                 <span className="text-xs font-bold text-slate-600">{b.name}</span>
+               </div>
+             ))}
+           </div>
+           <p className="text-2xl font-bold text-emerald-600 mb-8">Tổng điểm: {score}/240</p>
+           
+           <button onClick={() => { playSFX('click'); onComplete(); }} className="px-10 py-4 bg-yellow-500 text-slate-900 font-extrabold rounded-xl hover:bg-yellow-400 flex items-center justify-center mx-auto shadow-[0_0_15px_rgba(234,179,8,0.5)] transition-all transform hover:scale-105 mb-4 text-xl w-full max-w-lg">
+             <Award className="mr-3 w-6 h-6 flex-shrink-0" /> Kết thúc bài thực hành và xem bảng xếp hạng
+           </button>
+           
+           <button onClick={() => window.location.reload()} className="px-8 py-3 bg-slate-200 text-slate-700 font-bold rounded-lg hover:bg-slate-300 flex items-center justify-center mx-auto transition-colors mt-6 w-full max-w-lg">
+             <RotateCcw className="mr-2" /> Làm lại từ đầu
+           </button>
+         </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-4xl mx-auto p-6 mt-4">
+      <h2 className="text-2xl font-bold text-slate-800 mb-6 flex items-center">< BookOpen className="mr-3 text-emerald-500"/> BÁO CÁO THÍ NGHIỆM</h2>
+      <div className="bg-white p-8 rounded-2xl shadow-lg border border-slate-200 flex flex-col gap-4">
+        <div><label className="font-bold text-slate-700">Tên thí nghiệm:</label> <input type="text" defaultValue="Chứng minh quang hợp giải phóng O2 và tạo tinh bột" className="w-full p-2 border-b-2 border-slate-200 focus:border-emerald-500 outline-none text-emerald-700 font-medium" /></div>
+        <div><label className="font-bold text-slate-700">Hiện tượng quan sát được (Thí nghiệm O2):</label> <textarea value={textO2} onChange={e => setTextO2(e.target.value)} placeholder="Nhập hiện tượng (Gợi ý: bọt khí, que đóm...)" className="w-full p-3 bg-slate-50 border rounded-lg mt-1 outline-none focus:ring-2 ring-emerald-300 min-h-[80px]"></textarea></div>
+        <div><label className="font-bold text-slate-700">Hiện tượng quan sát được (Thí nghiệm Tinh bột):</label> <textarea value={textStarch} onChange={e => setTextStarch(e.target.value)} placeholder="Nhập hiện tượng màu sắc của 2 phần lá..." className="w-full p-3 bg-slate-50 border rounded-lg mt-1 outline-none focus:ring-2 ring-emerald-300 min-h-[80px]"></textarea></div>
+        <div><label className="font-bold text-slate-700">Kết luận chung:</label> <textarea value={textConclusion} onChange={e => setTextConclusion(e.target.value)} placeholder="Viết kết luận của bạn về sản phẩm của quang hợp..." className="w-full p-3 bg-slate-50 border rounded-lg mt-1 outline-none focus:ring-2 ring-emerald-300 min-h-[100px]"></textarea></div>
+        <button onClick={handleSubmit} className="mt-4 px-6 py-4 bg-emerald-600 text-white font-bold rounded-xl shadow-md hover:bg-emerald-700 text-lg">
+          Nộp Báo Cáo & Xem Kết Luận Khoa Học
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const Leaderboard = ({ currentTeam, currentScore, currentTime, showModal }) => {
+  const [teams, setTeams] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [password, setPassword] = useState('');
+  const [showDeleteAuth, setShowDeleteAuth] = useState(false);
+
+  useEffect(() => {
+    const loadData = async () => {
+      if (!db) {
+        setTeams([{ id: 'local_1', teamName: currentTeam, score: currentScore, time: currentTime }]);
+        setLoading(false);
+        return;
+      }
+      try {
+        await initAuth();
+        const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'leaderboard');
+        const snapshot = await getDocs(colRef);
+        let data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        
+        data.sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          return a.time - b.time;
+        });
+        setTeams(data);
+      } catch (e) {
+         console.error("Lỗi tải bảng xếp hạng", e);
+         showModal("Lỗi kết nối", "Không thể tải dữ liệu bảng xếp hạng từ hệ thống đám mây.", "error");
+      } finally {
+         setLoading(false);
+      }
+    };
+    loadData();
+  }, [currentTeam, currentScore, currentTime, showModal]);
+
+  const formatTime = (secs) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}:${s < 10 ? '0' : ''}${s}`;
+  };
+
+  const handleDelete = async () => {
+    playSFX('click');
+    if (password === 'Giaovien123') {
+       if (!db) {
+          setTeams([]);
+          setShowDeleteAuth(false);
+          showModal("Thành công", "Đã xóa bảng xếp hạng (chế độ không có kết nối).", "success");
+          return;
+       }
+       try {
+         await initAuth();
+         const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'leaderboard');
+         const snapshot = await getDocs(colRef);
+         for (const document of snapshot.docs) {
+           await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'leaderboard', document.id));
+         }
+         setTeams([]);
+         setShowDeleteAuth(false);
+         setPassword('');
+         showModal("Thành công", "Đã làm sạch toàn bộ dữ liệu bảng xếp hạng trên hệ thống!", "success");
+       } catch(e) {
+         console.error("Lỗi xóa", e);
+         showModal("Lỗi", "Đã xảy ra lỗi khi xóa dữ liệu trên hệ thống.", "error");
+       }
+    } else {
+       showModal("Từ chối truy cập", "Mật khẩu giáo viên không chính xác!", "error");
+    }
+  };
+
+  return (
+    <div className="flex flex-col items-center p-4 md:p-8 h-full overflow-y-auto animate-fadeIn bg-slate-50 relative">
+      <div className="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-5 pointer-events-none"></div>
+      <div className="bg-yellow-100 p-4 rounded-full mb-4 shadow-inner z-10">
+        <Award className="w-16 h-16 text-yellow-600" />
+      </div>
+      <h2 className="text-3xl md:text-4xl font-extrabold text-slate-800 mb-8 text-center drop-shadow-sm z-10">BẢNG XẾP HẠNG THÀNH TÍCH</h2>
+      
+      <div className="w-full max-w-4xl bg-white rounded-2xl shadow-xl overflow-hidden border border-slate-200 z-10">
+        <table className="w-full text-left">
+          <thead className="bg-emerald-600 text-white">
+            <tr>
+              <th className="p-4 text-center w-20">Hạng</th>
+              <th className="p-4">Tên Nhóm</th>
+              <th className="p-4 text-center w-32">Điểm số</th>
+              <th className="p-4 text-center w-32">Thời gian</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading ? <tr><td colSpan="4" className="text-center p-12 text-slate-500 font-medium animate-pulse text-lg">Đang đồng bộ dữ liệu...</td></tr> : 
+             teams.map((t, idx) => (
+              <tr key={t.id} className={`border-b transition-colors ${t.teamName === currentTeam && t.score === currentScore && t.time === currentTime ? 'bg-yellow-50 hover:bg-yellow-100' : 'hover:bg-slate-50'}`}>
+                <td className="p-4 text-center text-xl font-bold">
+                  {idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : <span className="text-slate-500">{idx + 1}</span>}
+                </td>
+                <td className={`p-4 text-lg ${t.teamName === currentTeam ? 'font-bold text-emerald-700' : 'text-slate-700'}`}>
+                  {t.teamName} {t.teamName === currentTeam && <span className="ml-3 text-xs bg-emerald-500 text-white px-3 py-1 rounded-full shadow-sm">(Bạn)</span>}
+                </td>
+                <td className="p-4 text-center text-emerald-600 font-bold text-xl">{t.score}</td>
+                <td className="p-4 text-center text-slate-600 font-mono font-medium">{formatTime(t.time)}</td>
+              </tr>
+            ))}
+            {!loading && teams.length === 0 && <tr><td colSpan="4" className="text-center p-8 text-slate-500 font-medium">Chưa có dữ liệu nhóm nào.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="mt-12 flex flex-col items-center bg-red-50 p-6 rounded-2xl border border-red-200 shadow-sm w-full max-w-md z-10">
+         <h3 className="text-red-800 font-bold mb-4 flex items-center text-lg"><Key className="mr-2"/> Khu vực dành cho Giáo viên</h3>
+         {!showDeleteAuth ? (
+           <button onClick={() => { playSFX('click'); setShowDeleteAuth(true); }} className="flex items-center text-red-600 hover:text-red-800 font-semibold px-6 py-3 border-2 border-red-300 rounded-xl hover:bg-red-100 transition-colors w-full justify-center bg-white">
+             <Trash2 className="w-5 h-5 mr-2"/> Đặt lại bảng xếp hạng
+           </button>
+         ) : (
+           <div className="flex flex-col gap-3 w-full">
+             <input type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="Nhập mật khẩu (Giaovien123)" className="p-3 border-2 border-red-200 rounded-xl outline-none focus:border-red-500 w-full text-center font-mono" />
+             <div className="flex gap-2">
+               <button onClick={handleDelete} className="bg-red-600 text-white px-4 py-3 rounded-xl hover:bg-red-700 font-bold flex-1 shadow-md transition-colors">Xác nhận xóa</button>
+               <button onClick={() => { playSFX('click'); setShowDeleteAuth(false); setPassword(''); }} className="bg-slate-300 text-slate-700 px-4 py-3 rounded-xl hover:bg-slate-400 font-bold flex-1 transition-colors">Hủy</button>
+             </div>
+           </div>
+         )}
+      </div>
+      <div className="mt-8 mb-8 z-10">
+        <button onClick={() => window.location.reload()} className="px-8 py-3 bg-slate-800 text-white font-bold rounded-xl hover:bg-slate-900 flex items-center shadow-lg transition-transform hover:scale-105">
+          <RotateCcw className="mr-2" /> Quay Lại Màn Hình Chính
+        </button>
+      </div>
+    </div>
+  );
+};
+
+export default function VirtualBioLab() {
+  const [stageIndex, setStageIndex] = useState(0);
+  const [score, setScore] = useState(0);
+  const [badges, setBadges] = useState([]);
+  const [modal, setModal] = useState(null); 
+  const [points, setPoints] = useState({});
+  const [muted, setMuted] = useState(false);
+
+  const [teamName, setTeamName] = useState('');
+  const [startTime, setStartTime] = useState(null);
+  const [elapsedTime, setElapsedTime] = useState(0);
+
+  const addScore = (category, amount) => {
+    setPoints(p => {
+      if (p[category] === undefined) {
+        setScore(s => s + amount);
+        return { ...p, [category]: amount };
+      }
+      return p;
+    });
+  };
+
+  const awardBadge = (id, name, icon) => {
+    setBadges(prev => {
+      if (!prev.find(b => b.id === id)) return [...prev, { id, name, icon }];
+      return prev;
+    });
+  };
+
+  const showModal = (title, msg, type = 'info', onConfirm = null) => {
+    if (type === 'success') playSFX('success');
+    else if (type === 'error') playSFX('error');
+    setModal({ title, msg, type, onConfirm });
+  };
+  
+  const closeModal = () => {
+    playSFX('click');
+    if (modal?.onConfirm) modal.onConfirm();
+    setModal(null);
+  };
+  
+  const nextStage = () => setStageIndex(i => Math.min(i + 1, STAGES.length - 1));
+
+  const handleStart = (name) => {
+    setTeamName(name);
+    setStartTime(Date.now());
+    nextStage(); 
+  };
+
+  const handleFinishReport = async () => {
+    const timeTaken = Math.floor((Date.now() - startTime) / 1000);
+    setElapsedTime(timeTaken);
+    
+    if (db) {
+      try {
+        await initAuth();
+        const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'leaderboard');
+        await addDoc(colRef, {
+          teamName: teamName,
+          score: score,
+          time: timeTaken,
+          timestamp: Date.now()
+        });
+      } catch (e) {
+        console.error("Lỗi lưu điểm", e);
+      }
+    }
+    nextStage();
+  };
+
+  const handleToggleMute = () => {
+    playSFX('click');
+    setMuted(toggleMuteAudio());
+  };
+
+  const progressBar = (
+    <div className="w-full bg-slate-200 h-10 rounded-t-xl flex items-center justify-between px-4 sticky top-0 z-50">
+      <div className="flex space-x-2 w-full mr-4">
+        {STAGES.filter(s => s !== 'START' && s !== 'LEADERBOARD').map((st, idx) => {
+          const adjustedCurrentIndex = stageIndex - 1;
+          return (
+            <div key={st} className={`h-2 flex-1 rounded-full transition-all duration-500 ${idx < adjustedCurrentIndex ? 'bg-emerald-500' : idx === adjustedCurrentIndex ? 'bg-emerald-400 animate-pulse' : 'bg-slate-300'}`} />
+          );
+        })}
+      </div>
+      <div className="flex items-center space-x-3">
+        <button onClick={handleToggleMute} className="p-1.5 bg-white rounded-md shadow-sm text-slate-600 hover:text-emerald-600 transition-colors">
+          {muted ? <VolumeX className="w-5 h-5"/> : <Volume2 className="w-5 h-5"/>}
+        </button>
+        <div className="font-bold text-slate-700 flex items-center whitespace-nowrap bg-white px-4 py-1 rounded-lg shadow-sm">
+          <Clock className="w-4 h-4 mr-2 text-blue-500" />
+          <span className="mr-4 text-slate-500 text-sm">{startTime && stageIndex > 0 && stageIndex < STAGES.length - 1 ? "Đang tính giờ..." : "--:--"}</span>
+          <Award className="w-5 h-5 mr-1 text-yellow-500" /> <span className="text-emerald-700">{score}/240 Đ</span>
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderStage = () => {
+    switch(STAGES[stageIndex]) {
+      case 'START': return <StartScreen onStart={handleStart} />;
+      case 'KHOI_DONG': return <WarmupPhase showModal={showModal} nextStage={nextStage} />;
+      case 'O2_EXP': return <O2Experiment addScore={addScore} awardBadge={awardBadge} showModal={showModal} nextStage={nextStage} />;
+      case 'STARCH_EXP': return <StarchExperiment addScore={addScore} showModal={showModal} nextStage={nextStage} />;
+      case 'ANALYSIS': return <CellAnalysis addScore={addScore} awardBadge={awardBadge} showModal={showModal} nextStage={nextStage} />;
+      case 'QUIZ': return <Quiz awardBadge={awardBadge} nextStage={nextStage} addScore={addScore} />;
+      case 'REPORT': return <Report score={score} badges={badges} addScore={addScore} onComplete={handleFinishReport} showModal={showModal} />;
+      case 'LEADERBOARD': return <Leaderboard currentTeam={teamName} currentScore={score} currentTime={elapsedTime} showModal={showModal} />;
+      default: return null;
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-100 font-sans text-slate-800 flex flex-col p-2 md:p-6">
+      <style dangerouslySetInnerHTML={{__html: customStyles}} />
+      <div className="max-w-6xl mx-auto w-full flex-1 flex flex-col bg-slate-50 shadow-2xl rounded-2xl overflow-hidden border border-slate-200">
+        {progressBar}
+        <div className="flex-1 relative overflow-y-auto overflow-x-hidden bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-emerald-50 via-slate-50 to-white">
+          {renderStage()}
+        </div>
+      </div>
+      {modal && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-2xl p-6 max-w-md w-full border-t-8 border-emerald-500 transform transition-all animate-fadeIn">
+            <div className="flex items-center mb-4">
+              {modal.type === 'error' && <AlertTriangle className="text-red-500 w-8 h-8 mr-3" />}
+              {modal.type === 'success' && <CheckCircle className="text-emerald-500 w-8 h-8 mr-3" />}
+              {modal.type === 'info' && <BookOpen className="text-blue-500 w-8 h-8 mr-3" />}
+              <h2 className="text-xl font-bold text-slate-800">{modal.title}</h2>
+            </div>
+            <p className="text-slate-600 mb-6 text-lg whitespace-pre-line">{modal.msg}</p>
+            <div className="flex justify-end">
+              <button onClick={closeModal} className="px-6 py-2 bg-emerald-500 text-white font-semibold rounded-lg hover:bg-emerald-600 transition-colors shadow-md">Đã hiểu</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
